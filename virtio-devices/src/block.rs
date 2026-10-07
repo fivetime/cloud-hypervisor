@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::num::Wrapping;
 use std::ops::Deref;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -57,6 +57,11 @@ const QUEUE_AVAIL_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 const COMPLETION_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
 // New 'wake up' event from the rate limiter
 const RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
+
+// Nova Kata (ADR-052): how long a pause waits for the disk's requests in
+// flight, and how often it says so.
+const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const SETTLE_POLL_MS: i32 = 1000;
 
 // latency scale, for reduce precision loss in calculate.
 const LATENCY_SCALE: u64 = 10000;
@@ -577,6 +582,73 @@ impl BlockEpollHandler {
 }
 
 impl EpollHelperHandler for BlockEpollHandler {
+    // Nova Kata (ADR-052): the vCPUs are stopped already when a device is
+    // paused. The requests the disk has in flight are completed and given
+    // back to the guest before the pause is acknowledged: the snapshot a
+    // pause precedes carries none of them, and a guest that arrives
+    // waiting for them waits for good. A disk that answers nothing within
+    // SETTLE_TIMEOUT is paused as before, with its requests lost.
+    fn settle_before_pause(
+        &mut self,
+        _helper: &mut EpollHelper,
+    ) -> result::Result<(), EpollHelperError> {
+        if self.inflight_requests.is_empty() {
+            return Ok(());
+        }
+        let epoll_fd = epoll::create(true).map_err(|e| {
+            EpollHelperError::HandleEvent(anyhow!("Failed to create the settle's epoll: {e:?}"))
+        })?;
+        // SAFETY: the fd is valid and owned by nothing else.
+        let epoll_file = unsafe { std::fs::File::from_raw_fd(epoll_fd) };
+        epoll::ctl(
+            epoll_file.as_raw_fd(),
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            self.disk_image.notifier().as_raw_fd(),
+            epoll::Event::new(epoll::Events::EPOLLIN, COMPLETION_EVENT.into()),
+        )
+        .map_err(|e| {
+            EpollHelperError::HandleEvent(anyhow!("Failed to watch the disk's completions: {e:?}"))
+        })?;
+        let began = std::time::Instant::now();
+        let mut events = [epoll::Event::new(epoll::Events::empty(), 0)];
+        while !self.inflight_requests.is_empty() {
+            match epoll::wait(epoll_file.as_raw_fd(), SETTLE_POLL_MS, &mut events) {
+                Ok(0) => {
+                    if began.elapsed() >= SETTLE_TIMEOUT {
+                        error!(
+                            "{} requests of the disk still in flight after {:?}; the pause goes on without them",
+                            self.inflight_requests.len(),
+                            SETTLE_TIMEOUT
+                        );
+                        break;
+                    }
+                    warn!(
+                        "{} requests of the disk in flight at the pause; waited {:?}",
+                        self.inflight_requests.len(),
+                        began.elapsed()
+                    );
+                }
+                Ok(_) => {
+                    self.disk_image.notifier().read().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {e:?}"))
+                    })?;
+                    self.process_queue_complete().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to process queue (complete): {e:?}"
+                        ))
+                    })?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(EpollHelperError::HandleEvent(anyhow!(
+                        "Failed to wait for the disk's completions: {e:?}"
+                    )));
+                }
+            }
+        }
+        self.try_signal_used_queue()
+    }
+
     fn handle_event(
         &mut self,
         _helper: &mut EpollHelper,

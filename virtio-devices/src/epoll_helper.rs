@@ -66,6 +66,14 @@ pub trait EpollHelperHandler {
         Ok(())
     }
 
+    // Nova Kata (ADR-052): invoked when a pause is received, before the
+    // pause is acknowledged. A device with work in flight completes it
+    // here: the snapshot a pause precedes carries none of it. By default,
+    // nothing is done.
+    fn settle_before_pause(&mut self, _helper: &mut EpollHelper) -> Result<(), EpollHelperError> {
+        Ok(())
+    }
+
     // In some situations, it might be useful to know the full list of events
     // triggered while waiting on epoll_wait(). And having this list provided
     // prior to the iterations over each event might help make some informed
@@ -220,6 +228,12 @@ impl EpollHelper {
                     }
                     EPOLL_HELPER_EVENT_PAUSE => {
                         info!("PAUSE_EVENT received, pausing epoll loop");
+
+                        // Nova Kata (ADR-052): the device's work in flight
+                        // ends before the pause is acknowledged.
+                        if let Err(e) = handler.settle_before_pause(self) {
+                            log::error!("Settling the device before its pause failed: {e:?}");
+                        }
 
                         // Acknowledge the pause is effective by using the
                         // paused_sync barrier.
