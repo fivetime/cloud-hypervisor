@@ -992,9 +992,22 @@ impl Block {
             return Err(Error::InvalidSize);
         }
 
-        self.disk_image
-            .resize(new_size)
-            .map_err(Error::DiskResize)?;
+        // A host block device has been grown by what owns it: the guest is
+        // given its size once it has the requested one, the device is never
+        // truncated. Any other disk is resized by its format.
+        match block::host_block_device_size(self.disk_image.fd().as_raw_fd()) {
+            Ok(Some(size)) if size == new_size => {}
+            Ok(Some(size)) => {
+                return Err(Error::DiskResize(DiskFileError::ResizeError(io::Error::other(
+                    format!("host block device has {size} bytes, not {new_size}"),
+                ))));
+            }
+            Ok(None) => self
+                .disk_image
+                .resize(new_size)
+                .map_err(Error::DiskResize)?,
+            Err(e) => return Err(Error::DiskResize(DiskFileError::ResizeError(e))),
+        }
 
         let nsectors = new_size / SECTOR_SIZE;
 

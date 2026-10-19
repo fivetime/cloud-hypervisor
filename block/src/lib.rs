@@ -34,7 +34,7 @@ use std::fmt::{self, Debug};
 use std::fs::File;
 use std::io::{self, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write};
 use std::os::linux::fs::MetadataExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Instant;
@@ -773,6 +773,28 @@ pub fn block_io_uring_is_supported() -> bool {
     }
 }
 
+/// The size of a host block device, or `None` for any other file.
+///
+/// A host block device is grown by what owns it (a storage system and the
+/// kernel's mapping of it), never by the VMM: its size is read, not set.
+pub fn host_block_device_size(fd: RawFd) -> io::Result<Option<u64>> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: FFI call with a valid fd and buffer
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstat succeeded, the buffer is initialized
+    if unsafe { (*stat.as_ptr()).st_mode & S_IFMT != S_IFBLK } {
+        return Ok(None);
+    }
+    // SAFETY: FFI call with a valid fd; the device's size is its end
+    let size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+    if size < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Some(size as u64))
+}
+
 /// Probe whether the file/device supports punch hole and zero range
 pub fn probe_sparse_support(file: &File) -> bool {
     let fd = file.as_raw_fd();
@@ -1185,5 +1207,21 @@ impl DiskTopology {
             minimum_io_size: Self::query_block_size(f, BlockSize::MinimumIo)?,
             optimal_io_size: Self::query_block_size(f, BlockSize::OptimalIo)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod host_block_device_tests {
+    use vmm_sys_util::tempfile::TempFile;
+
+    use super::*;
+
+    #[test]
+    fn a_regular_file_is_not_a_host_block_device() {
+        let file = TempFile::new().unwrap();
+        assert_eq!(
+            host_block_device_size(file.as_file().as_raw_fd()).unwrap(),
+            None
+        );
     }
 }
