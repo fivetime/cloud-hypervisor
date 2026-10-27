@@ -2,9 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+use std::ffi::CString;
+use std::io;
 use std::net::IpAddr;
-use std::path::Path;
-use std::{fs, io};
 
 use log::warn;
 use thiserror::Error;
@@ -39,24 +39,15 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
-fn check_mq_support(if_name: &Option<&str>, queue_pairs: usize) -> Result<()> {
-    if let Some(tap_name) = if_name {
-        let mq = queue_pairs > 1;
-        let path = format!("/sys/class/net/{tap_name}/tun_flags");
-        // interface does not exist, check is not required
-        if !Path::new(&path).exists() {
-            return Ok(());
-        }
-        let tun_flags_str = fs::read_to_string(path).map_err(Error::ReadSysfsTunFlags)?;
-        let tun_flags = u32::from_str_radix(tun_flags_str.trim().trim_start_matches("0x"), 16)
-            .map_err(Error::ConvertHexStringToInt)?;
-        if (tun_flags & net_gen::IFF_MULTI_QUEUE != 0) && !mq {
-            return Err(Error::MultiQueueNoDeviceSupport);
-        } else if (tun_flags & net_gen::IFF_MULTI_QUEUE == 0) && mq {
-            return Err(Error::MultiQueueNoTapSupport);
-        }
-    }
-    Ok(())
+/// Whether an interface of this name exists in the network namespace of
+/// the VMM. /sys/class/net shows the namespace of whoever mounted sysfs,
+/// which need not be the VMM's: a same-named interface of the host must not
+/// stand in for the VMM's own (Nova Kata).
+fn interface_exists(name: &str) -> bool {
+    CString::new(name).is_ok_and(|name| {
+        // SAFETY: a valid NUL-terminated string; the call reads it only.
+        unsafe { libc::if_nametoindex(name.as_ptr()) != 0 }
+    })
 }
 
 /// Opens a Tap device and configures it.
@@ -72,7 +63,7 @@ fn open_tap_rx_q_0(
     flags: Option<i32>,
 ) -> Result<Tap> {
     // Check if the given interface exists before we create it.
-    let tap_exists = if_name.is_some_and(|n| Path::new(&format!("/sys/class/net/{n}")).exists());
+    let tap_exists = if_name.is_some_and(interface_exists);
 
     let tap = match if_name {
         Some(name) => Tap::open_named(name, num_rx_q, flags).map_err(Error::TapOpen)?,
@@ -119,12 +110,10 @@ pub fn open_tap(
     let mut taps: Vec<Tap> = Vec::new();
     let mut ifname: String = String::new();
 
-    // In case the tap interface already exists, check if the number of
-    // queues is appropriate. The tap might not support multiqueue while
-    // the number of queues indicates the user expects multiple queues, or
-    // on the contrary, the tap might support multiqueue while the number
-    // of queues indicates the user doesn't expect multiple queues.
-    check_mq_support(&if_name, num_rx_q)?;
+    // An existing tap whose multiqueue flag is not the number of queues'
+    // is refused by the kernel when it is opened (TUNSETIFF, EINVAL); its
+    // flags are not read from sysfs, which may show another namespace's
+    // (Nova Kata).
 
     for i in 0..num_rx_q {
         let tap: Tap;
