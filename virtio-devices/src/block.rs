@@ -1223,12 +1223,55 @@ impl VirtioDevice for Block {
     }
 }
 
+impl Block {
+    // Nova Kata (ADR-033): a disk opened without O_DIRECT keeps the guest's
+    // writes in the host's page cache.
+    fn host_page_cache(&mut self) -> bool {
+        let fd = self.disk_image.fd().as_raw_fd();
+        // SAFETY: F_GETFL on a valid fd only reads its flags.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        flags >= 0 && flags & libc::O_DIRECT == 0
+    }
+}
+
 impl Pausable for Block {
+    // Nova Kata (ADR-033): a pause ends a live migration's source, and the
+    // destination resumes once the source has sent its state. What the
+    // guest wrote is made durable, once the requests in flight are settled,
+    // before the pause is acknowledged: the destination never reads a disk
+    // the source's host still holds writes of.
     fn pause(&mut self) -> result::Result<(), MigratableError> {
-        self.common.pause()
+        self.common.pause()?;
+        if self.host_page_cache() {
+            let fd = self.disk_image.fd().as_raw_fd();
+            // SAFETY: fsync on a valid fd.
+            if unsafe { libc::fsync(fd) } < 0 {
+                return Err(MigratableError::Pause(anyhow!(
+                    "Failed to sync disk {}: {}",
+                    self.id,
+                    io::Error::last_os_error()
+                )));
+            }
+        }
+        Ok(())
     }
 
+    // Nova Kata (ADR-033): the host's cached pages of the disk may predate
+    // what another host wrote to it (the source of a live migration). They
+    // are dropped before the guest runs again.
     fn resume(&mut self) -> result::Result<(), MigratableError> {
+        if self.host_page_cache() {
+            let fd = self.disk_image.fd().as_raw_fd();
+            // SAFETY: posix_fadvise on a valid fd only advises the kernel.
+            let ret = unsafe { libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+            if ret != 0 {
+                return Err(MigratableError::Resume(anyhow!(
+                    "Failed to drop the host's cache of disk {}: {}",
+                    self.id,
+                    io::Error::from_raw_os_error(ret)
+                )));
+            }
+        }
         self.common.resume()
     }
 }
